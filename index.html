@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Control de ingreso</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #071a38; color: #fff;
+      display: flex; flex-direction: column; align-items: center; padding: 24px;
+    }
+    .marca { text-align: center; margin-bottom: 18px; }
+    .marca .colegio { font-size: 22px; letter-spacing: 6px; font-weight: 200; text-transform: uppercase; }
+    .marca .nombre { font-size: 38px; font-weight: 600; margin-top: -4px; }
+    .marca .badge { display: inline-block; background: #e30613; border-radius: 14px;
+      padding: 6px 26px; font-size: 26px; font-weight: 800; margin-top: 8px; letter-spacing: 1px; }
+    .marca .sub { margin-top: 8px; font-size: 18px; opacity: .8; }
+
+    #tarjeta {
+      width: 100%; max-width: 900px; flex: 1; max-height: 520px;
+      border-radius: 28px; padding: 30px;
+      display: flex; flex-direction: column; align-items: center; justify-content: center;
+      text-align: center; background: #0d2a55; border: 3px solid #1c4180;
+    }
+    #tarjeta.ok { background: #0f8a4b; border-color: #34d27d; }
+    #tarjeta.error { background: #b3101c; border-color: #ff5a64; }
+
+    #estado { font-size: 34px; font-weight: 800; letter-spacing: 2px; }
+    #detalle { font-size: 24px; margin-top: 6px; opacity: .95; }
+    #nombre { font-size: 48px; font-weight: 700; margin: 18px 0 8px; line-height: 1.15; }
+    #grupoEtiqueta { font-size: 24px; opacity: .85; text-transform: uppercase; letter-spacing: 3px; }
+    #grupo { font-size: 130px; font-weight: 900; line-height: 1; }
+
+    .espera { font-size: 30px; opacity: .85; }
+    .punto { display: inline-block; width: 14px; height: 14px; border-radius: 50%;
+             background: #34d27d; margin-right: 10px; animation: pulso 1.4s infinite; }
+    @keyframes pulso { 0%,100% { opacity: .3; } 50% { opacity: 1; } }
+
+    .pie { width: 100%; max-width: 900px; display: flex; justify-content: space-between;
+           align-items: center; gap: 12px; margin-top: 14px; font-size: 20px; opacity: .9; }
+    #pendientes.alerta { color: #ffd54a; font-weight: bold; }
+    #aviso { display: none; background: #ffd54a; color: #5a3b00; font-weight: bold;
+             padding: 6px 14px; border-radius: 10px; }
+  </style>
+</head>
+<body>
+  <!-- Campo invisible que retiene el foco para recibir lo que "teclea" el lector -->
+  <input id="captura" autocomplete="off" autofocus
+         style="position:fixed; top:0; left:0; width:1px; height:1px; opacity:0; border:0;">
+
+  <div class="marca">
+    <div class="colegio">Colegio</div>
+    <div class="nombre">San Agustín</div>
+    <div class="badge">ADMISIONES 2027</div>
+    <div class="sub">Control de ingreso · Curso de preparación</div>
+  </div>
+
+  <div id="tarjeta">
+    <div class="espera">Cargando lista de postulantes...</div>
+  </div>
+
+  <div class="pie">
+    <div id="aviso">⚠ Escáner inactivo: haz clic en la pantalla</div>
+    <div id="pendientes"></div>
+    <div>Ingresos hoy: <b id="total">0</b></div>
+  </div>
+
+  <script>
+    // ====== CONFIGURA ESTAS DOS LÍNEAS ======
+    const API = 'https://script.google.com/macros/s/TU_ID_AQUI/exec';   // URL de la implementación (termina en /exec)
+    const TOKEN = 'sanagustin-adm2027-k8Xq4mZ';                          // IGUAL que en Code.gs
+    // ========================================
+
+    const tarjeta = document.getElementById('tarjeta');
+    const pendTxt = document.getElementById('pendientes');
+    const totalTxt = document.getElementById('total');
+    const captura = document.getElementById('captura');
+    const aviso = document.getElementById('aviso');
+
+    let postulantes = {};
+    let ingresados = {};          // ci -> hora de ingreso
+    let listo = false;
+    const esperandoLista = [];
+    const porGuardar = [];        // { codigo, momento }
+    let guardando = false;
+    let fallando = false;
+    let buffer = '';
+    let timerEnvio = null, timerReset = null;
+    let ultimoCodigo = '', ultimoTiempo = 0;
+
+    // ----- Sonidos -----
+    let audio;
+    function pitido(frecuencia, duracion) {
+      try {
+        audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+        if (audio.state === 'suspended') audio.resume();
+        const o = audio.createOscillator(), g = audio.createGain();
+        o.frequency.value = frecuencia; g.gain.value = 0.15;
+        o.connect(g); g.connect(audio.destination);
+        o.start(); o.stop(audio.currentTime + duracion);
+      } catch (e) {}
+    }
+
+    // ----- Mantener el foco siempre -----
+    function enfocar() {
+      window.focus();
+      captura.focus();
+    }
+    captura.addEventListener('blur', () => setTimeout(enfocar, 0));
+    document.addEventListener('click', enfocar);
+    window.addEventListener('load', enfocar);
+    enfocar();
+
+    // Cada 500 ms: reenfoca y avisa si la ventana no tiene foco
+    setInterval(() => {
+      enfocar();
+      aviso.style.display = document.hasFocus() ? 'none' : 'block';
+    }, 500);
+
+    // ----- Leer el teclado directamente -----
+    document.addEventListener('keydown', e => {
+      if (e.ctrlKey || e.altKey || e.metaKey) return;
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        clearTimeout(timerEnvio);
+        leer();
+        return;
+      }
+      if (e.key.length === 1) {
+        buffer += e.key;
+        clearTimeout(timerEnvio);
+        timerEnvio = setTimeout(leer, 150);
+      }
+    });
+
+    function leer() {
+      captura.value = '';
+      const codigo = buffer.trim();
+      buffer = '';
+      if (!codigo) return;
+      // Ignorar lectura doble del mismo código en menos de 2 segundos
+      const ahora = Date.now();
+      if (codigo === ultimoCodigo && ahora - ultimoTiempo < 2000) return;
+      ultimoCodigo = codigo; ultimoTiempo = ahora;
+
+      if (!listo) { esperandoLista.push(codigo); return; }
+      procesar(codigo);
+    }
+
+    // ----- Cargar lista al abrir -----
+    function cargar() {
+      fetch(API + '?accion=datos&token=' + encodeURIComponent(TOKEN))
+        .then(r => r.json())
+        .then(d => {
+          if (d.error) throw new Error(d.error);
+          postulantes = d.postulantes;
+          ingresados = d.ingresados;
+          actualizarTotal();
+          listo = true;
+          pantallaListo();
+          actualizarPendientes();
+          esperandoLista.splice(0).forEach(procesar);
+        })
+        .catch(() => {
+          tarjeta.className = 'error';
+          tarjeta.innerHTML = '<div class="espera">❌ Error al cargar. Reintentando...</div>';
+          setTimeout(cargar, 3000);
+        });
+    }
+    cargar();
+
+    function actualizarTotal() {
+      totalTxt.textContent = Object.keys(ingresados).length;
+    }
+
+    function pantallaListo() {
+      tarjeta.className = '';
+      tarjeta.innerHTML = '<div class="espera"><span class="punto"></span>Listo para escanear</div>';
+    }
+
+    function horaActual() {
+      const d = new Date();
+      return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    }
+
+    // ----- Resultado instantáneo, guardado en segundo plano -----
+    function procesar(codigo) {
+      const p = postulantes[codigo];
+      if (!p) {
+        mostrar({ ok: false, titulo: 'QR NO REGISTRADO' });
+        return;
+      }
+      if (ingresados[codigo]) {
+        mostrar({ ok: false, titulo: 'YA INGRESÓ HOY', detalle: 'Primer ingreso: ' + ingresados[codigo], postulante: p });
+        return;
+      }
+      ingresados[codigo] = horaActual();
+      actualizarTotal();
+      mostrar({ ok: true, titulo: 'CORRECTO', postulante: p });
+      porGuardar.push({ codigo: codigo, momento: Date.now() });
+      actualizarPendientes();
+      guardarSiguiente();
+    }
+
+    // ----- Guardar en segundo plano (con reintentos) -----
+    function guardarSiguiente() {
+      if (guardando || porGuardar.length === 0) return;
+      guardando = true;
+      const item = porGuardar[0];
+      const url = API + '?accion=registrar&token=' + encodeURIComponent(TOKEN)
+                + '&codigo=' + encodeURIComponent(item.codigo)
+                + '&momento=' + item.momento;
+      fetch(url)
+        .then(r => r.json())
+        .then(d => {
+          if (d.error || !d.ok) throw new Error(d.error || 'fallo');
+          porGuardar.shift();
+          guardando = false;
+          fallando = false;
+          actualizarPendientes();
+          guardarSiguiente();
+        })
+        .catch(() => {
+          guardando = false;
+          fallando = true;
+          actualizarPendientes();
+          setTimeout(guardarSiguiente, 3000);
+        });
+    }
+
+    function actualizarPendientes() {
+      if (porGuardar.length === 0) {
+        pendTxt.className = ''; pendTxt.textContent = '✔ Todo guardado';
+      } else if (fallando) {
+        pendTxt.className = 'alerta'; pendTxt.textContent = '⚠ Sin guardar: ' + porGuardar.length + ' (reintentando)';
+      } else {
+        pendTxt.className = 'alerta'; pendTxt.textContent = 'Guardando: ' + porGuardar.length;
+      }
+    }
+
+    // ----- Mostrar resultado -----
+    function mostrar(r) {
+      clearTimeout(timerReset);
+      tarjeta.className = r.ok ? 'ok' : 'error';
+      tarjeta.innerHTML = '';
+
+      const estado = document.createElement('div');
+      estado.id = 'estado';
+      estado.textContent = (r.ok ? '✅ ' : '❌ ') + r.titulo;
+      tarjeta.appendChild(estado);
+
+      if (r.detalle) {
+        const d = document.createElement('div'); d.id = 'detalle'; d.textContent = r.detalle;
+        tarjeta.appendChild(d);
+      }
+
+      if (r.postulante) {
+        const n = document.createElement('div'); n.id = 'nombre'; n.textContent = r.postulante.nombre;
+        const et = document.createElement('div'); et.id = 'grupoEtiqueta'; et.textContent = 'Grupo';
+        const g = document.createElement('div'); g.id = 'grupo'; g.textContent = r.postulante.grupo;
+        tarjeta.appendChild(n); tarjeta.appendChild(et); tarjeta.appendChild(g);
+      }
+
+      r.ok ? pitido(1000, 0.15) : pitido(300, 0.4);
+      timerReset = setTimeout(pantallaListo, 3000);
+    }
+  </script>
+</body>
+</html>
